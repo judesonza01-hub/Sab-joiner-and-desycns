@@ -1,0 +1,591 @@
+-- Chered Hub - EdiÃ§Ã£o Completa (otimizada para mobile)
+-- IntegraÃ§Ã£o: removido FPS Devourer, adicionado Desync Body (Anti-Hit), Source (Inf Jump / JumpBoost) e FLY TO BASE
+-- Discord principal atualizado: https://discord.gg/qvVEZt3q88 
+-- Data da modificaÃ§Ã£o: 2025-10-10
+-- OtimizaÃ§Ãµes mobile: cache de descendants, pooling de sons, intervalos ajustados, debounce otimizado
+-- ÐÐ¾Ð²Ð¾Ðµ: ÐŸÐ¾Ð´ÑÐ²ÐµÑ‚ÐºÐ° Ñ‚ÐµÐ»Ð° Ð¿Ñ€Ð¸ Desync (Ð·ÐµÐ»ÐµÐ½Ñ‹Ð¹ fill, ÐºÑ€Ð°ÑÐ½Ñ‹Ð¹ outline Ð´Ð»Ñ Ð¾Ñ€Ð¸Ð³Ð¸Ð½Ð°Ð»Ð° Ð¸ ÐºÐ»Ð¾Ð½Ð°)
+
+----------------------------------------------------------------
+-- PERSISTÃŠNCIA (somente BEST / SECRET / BASE)
+----------------------------------------------------------------
+local CONFIG_DIR = 'CheredHub'
+local CONFIG_FILE = CONFIG_DIR .. '/config.json'
+local defaultConfig = { espBest = false, espSecret = false, espBase = false }
+local currentConfig = {}
+local HttpService = game:GetService('HttpService')
+local function safeDecode(str)
+    local ok, res = pcall(function()
+        return HttpService:JSONDecode(str)
+    end)
+    return ok and res or nil
+end
+local function safeEncode(tbl)
+    local ok, res = pcall(function()
+        return HttpService:JSONEncode(tbl)
+    end)
+    return ok and res or '{}'
+end
+local function ensureDir()
+    if isfolder and not isfolder(CONFIG_DIR) then
+        pcall(function()
+            makefolder(CONFIG_DIR)
+        end)
+    end
+end
+local function loadConfig()
+    for k, v in pairs(defaultConfig) do
+        currentConfig[k] = v
+    end
+    if not (isfile and readfile and isfile(CONFIG_FILE)) then
+        return
+    end
+    local ok, data = pcall(function()
+        return readfile(CONFIG_FILE)
+    end)
+    if ok and data and #data > 0 then
+        local decoded = safeDecode(data)
+        if decoded then
+            for k, v in pairs(defaultConfig) do
+                if decoded[k] ~= nil then
+                    currentConfig[k] = decoded[k]
+                end
+            end
+        end
+    end
+end
+local saveDebounce = false
+local function saveConfig()
+    if not writefile then
+        return
+    end
+    if saveDebounce then
+        return
+    end
+    saveDebounce = true
+    task.delay(0.35, function()
+        saveDebounce = false 
+    end)
+    ensureDir()
+    local json = safeEncode(currentConfig)
+    pcall(function()
+        writefile(CONFIG_FILE, json)
+    end)
+end
+
+----------------------------------------------------------------
+-- SERVICES
+----------------------------------------------------------------
+local Players = game:GetService('Players')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local UserInputService = game:GetService('UserInputService')
+local Workspace = game:GetService('Workspace')
+local RunService = game:GetService('RunService')
+local StarterGui = game:GetService('StarterGui')
+local TweenService = game:GetService('TweenService')
+local SoundService = game:GetService('SoundService')
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild('PlayerGui')
+
+----------------------------------------------------------------
+-- LIMPA GUI ANTIGA
+----------------------------------------------------------------
+do
+    local old = playerGui:FindFirstChild('NameliunHub_FULL')
+    if old then
+        pcall(function()
+            old:Destroy()
+        end)
+    end
+    local old3d = playerGui:FindFirstChild('Nameliun3DFloor')
+    if old3d then
+        pcall(function()
+            old3d:Destroy()
+        end)
+    end
+end
+
+----------------------------------------------------------------
+-- UTILITÃRIOS
+----------------------------------------------------------------
+local function getHumanoid()
+    local c = player.Character
+    return c and c:FindFirstChildOfClass('Humanoid')
+end
+local function getHRP()
+    local c = player.Character
+    return c and c:FindFirstChild('HumanoidRootPart')
+end
+local function notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore(
+            'SendNotification',
+            { Title = title or 'Info', Text = text or '', Duration = dur or 3 }
+        )
+    end)
+end
+local function showNotification(title, text, dur)
+    notify(title, text, dur)
+end
+
+-- safe GetAttribute helper
+local function safeGetAttribute(obj, name)
+    if not obj then
+        return nil
+    end
+    if obj.GetAttribute then
+        local ok, res = pcall(function()
+            return obj:GetAttribute(name)
+        end)
+        if ok then
+            return res
+        end
+    end
+    return nil
+end
+
+----------------------------------------------------------------
+-- ESTADOS ESP
+----------------------------------------------------------------
+local espConfig = {
+    enabledBest = false,
+    enabledSecret = false,
+    enabledBase = false,
+    enabledPlayer = false,
+}
+local statusLabel
+local espBoxes = {}
+
+----------------------------------------------------------------
+-- PARSE MONEY
+----------------------------------------------------------------
+local function parseMoneyPerSec(text)
+    if not text then
+        return 0
+    end
+    local mult = 1
+    local numberStr = text:match('[%d%.]+')
+    if not numberStr then
+        return 0
+    end
+    if text:find('K') then
+        mult = 1_000
+    elseif text:find('M') then
+        mult = 1_000_000
+    elseif text:find('B') then
+        mult = 1_000_000_000
+    elseif text:find('T') then
+        mult = 1_000_000_000_000
+    elseif text:find('Q') then
+        mult = 1_000_000_000_000_000
+    end
+    local number = tonumber(numberStr)
+    return number and number * mult or 0
+end
+
+----------------------------------------------------------------
+-- VISUAL CONSTANTES
+----------------------------------------------------------------
+local ESP_FONT_NAME = Enum.Font.GothamSemibold
+local ESP_RED_BRIGHT = Color3.fromRGB(255, 0, 60)
+local ESP_GREEN = Color3.fromRGB(0, 240, 60)
+
+-- Intervalos otimizados para mobile
+local ESP_UPDATE_INTERVAL = 1.5
+local BASE_UPDATE_INTERVAL = 1.5
+local GLOW_UPDATE_INTERVAL = 0.25
+
+----------------------------------------------------------------
+-- CACHE SYSTEM (otimizaÃ§Ã£o mobile)
+----------------------------------------------------------------
+local plotCache = {}
+local CACHE_LIFETIME = 3
+
+local function getCachedDescendants(obj)
+    if not obj or not obj.Parent then
+        return {}
+    end
+    local now = tick()
+    local cached = plotCache[obj]
+    if cached and (now - cached.time) < CACHE_LIFETIME then
+        return cached.descendants
+    end
+    local desc = obj:GetDescendants()
+    plotCache[obj] = { descendants = desc, time = now }
+    return desc
+end
+
+-- Limpa cache periodicamente
+task.spawn(function()
+    while true do
+        task.wait(10)
+        local now = tick()
+        for obj, data in pairs(plotCache) do
+            if
+                not obj
+                or not obj.Parent
+                or (now - data.time) > CACHE_LIFETIME
+            then
+                plotCache[obj] = nil
+            end
+        end
+    end
+end)
+
+----------------------------------------------------------------
+-- SOUND POOLING (otimizaÃ§Ã£o mobile)
+----------------------------------------------------------------
+local soundPool = {}
+local MAX_SOUNDS = 2
+
+local function playSoundOptimized(soundId, volume)
+    pcall(function()
+        -- Limpa sons invÃ¡lidos
+        for i = #soundPool, 1, -1 do
+            if not soundPool[i] or not soundPool[i].Parent then
+                table.remove(soundPool, i)
+            end
+        end
+
+        -- Limita sons simultÃ¢neos
+        if #soundPool >= MAX_SOUNDS then
+            local oldest = table.remove(soundPool, 1)
+            if oldest then
+                oldest:Destroy()
+            end
+        end
+
+        local s = Instance.new('Sound')
+        s.SoundId = soundId
+        s.Volume = volume or 1
+        s.Looped = false
+        s.Parent = SoundService
+
+        table.insert(soundPool, s)
+
+        s:Play()
+        s.Ended:Connect(function()
+            task.wait(0.3)
+            pcall(function()
+                s:Destroy()
+            end)
+        end)
+    end)
+end
+
+----------------------------------------------------------------
+-- CLEAR FUNÃ‡Ã•ES
+----------------------------------------------------------------
+local function clearAllBestSecret()
+    local plotsFolder = Workspace:FindFirstChild('Plots')
+    if not plotsFolder then
+        return
+    end
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        for _, inst in ipairs(plot:GetDescendants()) do
+            if
+                inst:IsA('BillboardGui')
+                and (inst.Name == 'Best_ESP' or inst.Name == 'Secret_ESP')
+            then
+                pcall(function()
+                    inst:Destroy()
+                end)
+            end
+        end
+    end
+end
+
+local function clearPlayerESP()
+    for plr, objs in pairs(espBoxes) do
+        if objs.box then
+            pcall(function()
+                objs.box:Destroy()
+            end)
+        end
+        if objs.text then
+            pcall(function()
+                objs.text:Destroy()
+            end)
+        end
+    end
+    espBoxes = {}
+end
+
+----------------------------------------------------------------
+-- BEST / SECRET ESP (otimizado)
+----------------------------------------------------------------
+local function updateBestSecret()
+    local plotsFolder = Workspace:FindFirstChild('Plots')
+    if not plotsFolder then
+        clearAllBestSecret()
+        return
+    end
+    if not (espConfig.enabledBest or espConfig.enabledSecret) then
+        clearAllBestSecret()
+        return
+    end
+
+    local myPlotName
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        local plotSign = plot:FindFirstChild('PlotSign')
+        if
+            plotSign
+            and plotSign:FindFirstChild('YourBase')
+            and plotSign.YourBase.Enabled
+        then
+            myPlotName = plot.Name
+            break
+        end
+    end
+
+    local bestPetInfo
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        if plot.Name ~= myPlotName then
+            -- Usa cache otimizado
+            local descendants = getCachedDescendants(plot)
+            for _, desc in ipairs(descendants) do
+                if
+                    desc:IsA('TextLabel')
+                    and desc.Name == 'Rarity'
+                    and desc.Parent
+                    and desc.Parent:FindFirstChild('DisplayName')
+                then
+                    local parentModel = desc.Parent.Parent
+                    local rarity = desc.Text
+                    local displayName = desc.Parent.DisplayName.Text
+
+                    if rarity == 'Secret' then
+                        if espConfig.enabledSecret then
+                            if not parentModel:FindFirstChild('Secret_ESP') then
+                                local billboard = Instance.new('BillboardGui')
+                                billboard.Name = 'Secret_ESP'
+                                billboard.Size = UDim2.new(0, 198, 0, 60)
+                                billboard.StudsOffset = Vector3.new(0, 3.3, 0)
+                                billboard.AlwaysOnTop = true
+                                billboard.Parent = parentModel
+                                local label = Instance.new('TextLabel')
+                                label.Text = displayName
+                                label.Size = UDim2.new(1, 0, 1, 0)
+                                label.BackgroundTransparency = 1
+                                label.TextScaled = true
+                                label.Font = ESP_FONT_NAME
+                                label.TextColor3 = ESP_RED_BRIGHT
+                                label.TextStrokeColor3 = Color3.new(0, 0, 0)
+                                label.TextStrokeTransparency = 0.2
+                                label.Parent = billboard
+                            end
+                        else
+                            if parentModel:FindFirstChild('Secret_ESP') then
+                                parentModel.Secret_ESP:Destroy()
+                            end
+                        end
+                    end
+
+                    if espConfig.enabledBest then
+                        local genLabel =
+                            desc.Parent:FindFirstChild('Generation')
+                        if genLabel and genLabel:IsA('TextLabel') then
+                            local mps = parseMoneyPerSec(genLabel.Text)
+                            if not bestPetInfo or mps > bestPetInfo.mps then
+                                bestPetInfo = {
+                                    petName = displayName,
+                                    genText = genLabel.Text,
+                                    mps = mps,
+                                    model = parentModel,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if espConfig.enabledBest then
+        for _, plot in ipairs(plotsFolder:GetChildren()) do
+            for _, inst in ipairs(plot:GetDescendants()) do
+                if inst:IsA('BillboardGui') and inst.Name == 'Best_ESP' then
+                    pcall(function()
+                        inst:Destroy()
+                    end)
+                end
+            end
+        end
+        if bestPetInfo and bestPetInfo.mps > 0 and bestPetInfo.model then
+            local billboard = Instance.new('BillboardGui')
+            billboard.Name = 'Best_ESP'
+            billboard.Size = UDim2.new(0, 303, 0, 75)
+            billboard.StudsOffset = Vector3.new(0, 4.84, 0)
+            billboard.AlwaysOnTop = true
+            billboard.Parent = bestPetInfo.model
+            local nameLabel = Instance.new('TextLabel')
+            nameLabel.Size = UDim2.new(1, 0, 0, 35)
+            nameLabel.Position = UDim2.new(0, 0, 0, 0)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Text = bestPetInfo.petName
+            nameLabel.TextColor3 = ESP_RED_BRIGHT
+            nameLabel.Font = ESP_FONT_NAME
+            nameLabel.TextSize = 25
+            nameLabel.TextStrokeTransparency = 0.07
+            nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+            nameLabel.Parent = billboard
+            local moneyLabel = Instance.new('TextLabel')
+            moneyLabel.Size = UDim2.new(1, 0, 0, 22)
+            moneyLabel.Position = UDim2.new(0, 0, 0, 35)
+            moneyLabel.BackgroundTransparency = 1
+            moneyLabel.Text = bestPetInfo.genText
+            moneyLabel.TextColor3 = ESP_GREEN
+            moneyLabel.Font = ESP_FONT_NAME
+            moneyLabel.TextSize = 22
+            moneyLabel.TextStrokeTransparency = 0.17
+            moneyLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+            moneyLabel.Parent = billboard
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- PLAYER ESP
+----------------------------------------------------------------
+local function updatePlayerESP()
+    if espConfig.enabledPlayer then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if
+                plr ~= player
+                and plr.Character
+                and plr.Character:FindFirstChild('HumanoidRootPart')
+            then
+                local hrp = plr.Character.HumanoidRootPart
+                if not espBoxes[plr] then
+                    espBoxes[plr] = {}
+                    local box = Instance.new('BoxHandleAdornment')
+                    box.Size = Vector3.new(4, 6, 4)
+                    box.Adornee = hrp
+                    box.AlwaysOnTop = true
+                    box.ZIndex = 10
+                    box.Transparency = 0.5
+                    box.Color3 = Color3.fromRGB(250, 0, 60)
+                    box.Parent = hrp
+                    espBoxes[plr].box = box
+
+                    local billboard = Instance.new('BillboardGui')
+                    billboard.Adornee = hrp
+                    billboard.Size = UDim2.new(0, 200, 0, 30)
+                    billboard.StudsOffset = Vector3.new(0, 4, 0)
+                    billboard.AlwaysOnTop = true
+                    local label = Instance.new('TextLabel', billboard)
+                    label.Size = UDim2.new(1, 0, 1, 0)
+                    label.BackgroundTransparency = 1
+                    label.TextColor3 = Color3.fromRGB(220, 0, 60)
+                    label.TextStrokeTransparency = 0
+                    label.Text = plr.Name
+                    label.Font = Enum.Font.GothamBold
+                    label.TextSize = 18
+                    espBoxes[plr].text = billboard
+                    billboard.Parent = hrp
+                else
+                    if espBoxes[plr].box then
+                        espBoxes[plr].box.Adornee = hrp
+                    end
+                    if espBoxes[plr].text then
+                        espBoxes[plr].text.Adornee = hrp
+                    end
+                end
+            else
+                if espBoxes[plr] then
+                    if espBoxes[plr].box then
+                        pcall(function()
+                            espBoxes[plr].box:Destroy()
+                        end)
+                    end
+                    if espBoxes[plr].text then
+                        pcall(function()
+                            espBoxes[plr].text:Destroy()
+                        end)
+                    end
+                    espBoxes[plr] = nil
+                end
+            end
+        end
+    else
+        clearPlayerESP()
+    end
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+    local objs = espBoxes[plr]
+    if objs then
+        if objs.box then
+            pcall(function()
+                objs.box:Destroy()
+            end)
+        end
+        if objs.text then
+            pcall(function()
+                objs.text:Destroy()
+            end)
+        end
+        espBoxes[plr] = nil
+    end
+end)
+
+----------------------------------------------------------------
+-- LOOP PRINCIPAL DE ESP
+----------------------------------------------------------------
+task.spawn(function()
+    while true do
+        task.wait(ESP_UPDATE_INTERVAL)
+        if espConfig.enabledBest or espConfig.enabledSecret then
+            pcall(updateBestSecret)
+        end
+        if espConfig.enabledPlayer then
+            pcall(updatePlayerESP)
+        end
+    end
+end)
+
+----------------------------------------------------------------
+-- CARREGA CONFIG
+----------------------------------------------------------------
+loadConfig()
+espConfig.enabledBest = currentConfig.espBest
+espConfig.enabledSecret = currentConfig.espSecret
+espConfig.enabledBase = currentConfig.espBase
+espConfig.enabledPlayer = false
+
+----------------------------------------------------------------
+-- AIMBOT TEIA
+----------------------------------------------------------------
+local WEBSLINGER_NAME = 'Web Slinger'
+local function getClosestPlayerWithLowerTorso()
+    local myChar = player.Character
+    local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
+    if not myHRP then
+        return nil
+    end
+    local closest, closestDist = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if
+            plr ~= player
+            and plr.Character
+            and plr.Character:FindFirstChild('LowerTorso')
+        then
+            local lt = plr.Character.LowerTorso
+            local dist = (lt.Position - myHRP.Position).Magnitude
+            if dist < closestDist then
+                closest, closestDist = plr, dist
+            end
+        end
+    end
+    return closest
+end
+local function fireWebSlingerLowerTorso()
+    local bp = player:FindFirstChildOfClass('Backpack')
+    if bp and bp:FindFirstChild(WEBSLINGER_NAME) then
+        player.Character.Humanoid:EquipTool(bp[WEBSLINGER_NAME])
+    end
+    if not player.Character:FindFirstChild(WEBSLINGER_NAME) then
+        return
+    end
+    local remoteEvent = ReplicatedStorage:FindFirstChild('Packages')
+        and ReplicatedStorage.Packages:FindFirstChild('Net')
+        and ReplicatedStorage.Packages.Net:FindFirstChild('RE/UseItem')
